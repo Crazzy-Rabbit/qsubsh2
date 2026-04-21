@@ -2,7 +2,7 @@
 
 A simple job submitter for PBS Pro, Torque, SGE and Slurm.
 
-`qsubsh2.sh` detects the cluster type automatically and submits jobs with the correct backend command without making you rewrite scheduler-specific headers such as `#PBS` or `#SBATCH`. It keeps the same calling style as classic `qsubshcom`, but improves submission failure handling, submission logging, temporary script cleanup, and runtime resource monitoring.
+`qsubsh2.sh` detects the cluster type automatically and submits jobs with the correct backend command without making you rewrite scheduler-specific headers such as `#PBS` or `#SBATCH`. It keeps the same calling style as classic [qsubshcom](https://github.com/zhilizheng/qsubshcom), but improves submission failure handling, submission logging, temporary script cleanup, and runtime resource monitoring.
 
 It is designed for the common workflow of:
 
