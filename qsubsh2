@@ -4,7 +4,7 @@
 # Compatible job submitter for PBS Pro, Torque, SGE and Slurm
 #
 # This script keeps the same calling style as qsubshcom:
-# qsubsh2.sh "command1 |; command2" num_CPU memory task_name wait_time other_params
+# qsubsh2 "command1 |; command2" num_CPU memory task_name wait_time other_params
 #
 # Internal improvements:
 # - submit failure is logged and returns non-zero
