@@ -7,7 +7,7 @@ A simple job submitter for PBS Pro, Torque, SGE and Slurm.
 `qsubsh2` has no extra dependency in a normal Linux cluster environment beyond the scheduler commands already installed by the system admin. Download `qsubsh2`, `chmod +x qsubsh2`, put it into your `PATH`, then it is ready to go.
 
 Author: Lulu, adapted from [qsubshcom](https://github.com/zhilizheng/qsubshcom).  
-MIT, see LICENSE; no warrenty, no citaion needed.
+MIT, see LICENSE; no warrenty, no citation needed.
 
 ## Installation
 
