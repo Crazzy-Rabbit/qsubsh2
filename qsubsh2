@@ -1,496 +1,318 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #===============================================================================
-# qsubsh2.sh
+# qsubsh2
 # Compatible job submitter for PBS Pro, Torque, SGE and Slurm
 #
-# Improvements over qsubshcom while keeping the same calling style:
-# - shell-style parsing for other_params, then pass submit params as arrays
-# - explicit submit failure handling
-# - safer temp file cleanup via trap
-# - better array task handling, including Torque TASK_ID fallback
-# - monitor uses CPU seconds instead of summing formatted cputime strings
+# This script keeps the same calling style as qsubshcom:
+# qsubsh2.sh "command1 |; command2" num_CPU memory task_name wait_time other_params
+#
+# Internal improvements:
+# - submit failure is logged and returns non-zero
+# - temp script cleanup uses trap
+# - monitor sums CPU seconds instead of formatted cputime strings
+# - small robustness fixes for quoting and array task id fallback
 #===============================================================================
 
 set -o pipefail
 
-usage() {
-    cat <<'EOF'
-usage:
-  qsubsh2.sh "command1 |; command2" num_cpu memory task_name wait_time other_params
-
-notes:
-  - command supports {TASK_ID} placeholder for array jobs
-  - other_params is parsed using shell-style quoting, so quoted values are preserved
-  - reserved meta params:
-      -ge=TOR|SGE|PBS|SLM
-      -wait=JOB1:JOB2:JOB3
-      -array=1-100:2
-      -log=log_name
-      -ntype=node_type
-      -acct=account_name
-      -queue=queue_name
-  - all other params are forwarded to qsub/sbatch
-EOF
-}
-
-die() {
-    echo "Error: $*" >&2
+scriptname=$(mktemp "${TMPDIR:-/tmp}/qsubsh2.XXXXXX") || {
+    echo "Error when creating temporary submit script" >&2
     exit 1
 }
 
-warn() {
-    echo "Warning: $*" >&2
-}
-
 cleanup() {
-    if [[ -n "${scriptname:-}" && -f "${scriptname:-}" ]]; then
-        rm -f "$scriptname"
-    fi
+    rm -f "$scriptname"
 }
-
-parse_shell_words() {
-    local input="$1"
-    PARSED_WORDS=()
-
-    if [[ -z "${input//[[:space:]]/}" ]]; then
-        return 0
-    fi
-
-    set -f
-    eval "PARSED_WORDS=($input)"
-    local status=$?
-    set +f
-    return "$status"
-}
-
-detect_grid_engine() {
-    local forced_ge="${1:-}"
-    local ge=""
-
-    if [[ -n "$forced_ge" ]]; then
-        ge="${forced_ge^^}"
-        [[ "$ge" =~ ^(TOR|SGE|PBS|SLM)$ ]] || die "Unsupported -ge value: $forced_ge"
-        printf '%s\n' "$ge"
-        return 0
-    fi
-
-    if command -v qsh >/dev/null 2>&1; then
-        printf 'SGE\n'
-        return 0
-    fi
-
-    if command -v qsub >/dev/null 2>&1; then
-        if command -v qchkpt >/dev/null 2>&1; then
-            printf 'TOR\n'
-        else
-            printf 'PBS\n'
-        fi
-        return 0
-    fi
-
-    if command -v sbatch >/dev/null 2>&1; then
-        printf 'SLM\n'
-        return 0
-    fi
-
-    return 1
-}
-
-job_exists() {
-    local ge="$1"
-    local job="$2"
-
-    case "$ge" in
-        PBS|TOR)
-            qstat -f "$job" >/dev/null 2>&1
-            ;;
-        SGE)
-            qstat -j "$job" >/dev/null 2>&1
-            ;;
-        SLM)
-            squeue -h -j "$job" 2>/dev/null | grep -q .
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-parse_job_id() {
-    local ge="$1"
-    local output="$2"
-
-    case "$ge" in
-        SGE)
-            sed -nE 's/Your (job|job-array) ([0-9]+).*/\2/p' <<< "$output" | head -n 1
-            ;;
-        PBS)
-            awk 'NF { print; exit }' <<< "$output"
-            ;;
-        TOR)
-            awk 'NF { last=$0 } END { print last }' <<< "$output"
-            ;;
-        SLM)
-            sed -nE 's/.* ([0-9]+).*/\1/p' <<< "$output" | head -n 1
-            ;;
-    esac
-}
-
-submit_torque_array_bridge() {
-    local array_job="$1"
-    local self_path="$2"
-    shift 2
-    local remain_bridge_params=("$@")
-    local bridge_extra="-W depend=afterokarray:${array_job}"
-    local remain_encoded=""
-    local bridge_output=""
-    local bridge_job_id=""
-
-    if (( ${#remain_bridge_params[@]} > 0 )); then
-        printf -v remain_encoded '%q ' "${remain_bridge_params[@]}"
-        remain_encoded="${remain_encoded% }"
-        bridge_extra="${bridge_extra} ${remain_encoded}"
-    fi
-
-    if ! bridge_output=$(
-        "$self_path" \
-            "echo torque-array-wait-bridge" \
-            1 \
-            10MB \
-            qwait_ar \
-            00:00:30 \
-            "$bridge_extra" 2>&1
-    ); then
-        warn "Failed to create Torque array wait bridge for $array_job"
-        warn "$bridge_output"
-        return 1
-    fi
-
-    bridge_job_id="$(awk 'NF { last=$0 } END { print last }' <<< "$bridge_output")"
-    [[ -n "$bridge_job_id" ]] || return 1
-    printf '%s\n' "$bridge_job_id"
-}
-
-if [[ $# -ne 6 ]]; then
-    usage >&2
-    die "Expected 6 arguments, got $#"
-fi
-
-command_string="$1"
-cpu="$2"
-memory_raw="$3"
-job_name="$4"
-walltime="$5"
-raw_other_params="$6"
-self_path="${BASH_SOURCE[0]:-$0}"
-
-[[ "$cpu" =~ ^[1-9][0-9]*$ ]] || die "num_cpu must be a positive integer"
-[[ -n "$job_name" ]] || die "task_name cannot be empty"
-
-mkdir -p ./job_reports || die "Cannot create ./job_reports"
-today="$(date +%Y.%m.%d_%H.%M.%S)"
-today_log="$(date +%Y.%m.%d)"
-
-raw_additions="$raw_other_params"
-if [[ -n "${QSUBSHCOM_EXTRAS:-}" ]]; then
-    raw_additions="${raw_additions} ${QSUBSHCOM_EXTRAS}"
-fi
-
-if ! parse_shell_words "$raw_additions"; then
-    die "Unable to parse other_params. Check quotes and escaping."
-fi
-
-force_ge=""
-wait_jobs=""
-array_spec=""
-log_stem=""
-node_type=""
-queue=""
-account=""
-remaining_submit_params=()
-
-for token in "${PARSED_WORDS[@]}"; do
-    case "$token" in
-        -ge=*)
-            force_ge="${token#-ge=}"
-            ;;
-        -wait=*)
-            wait_jobs="${token#-wait=}"
-            ;;
-        -array=*)
-            array_spec="${token#-array=}"
-            ;;
-        -log=*)
-            log_stem="${token#-log=}"
-            ;;
-        -ntype=*)
-            node_type="${token#-ntype=}"
-            ;;
-        -queue=*)
-            queue="${token#-queue=}"
-            ;;
-        -acct=*)
-            account="${token#-acct=}"
-            ;;
-        *)
-            remaining_submit_params+=("$token")
-            ;;
-    esac
-done
-
-GE="$(detect_grid_engine "$force_ge")" || die "Cannot recognize the grid engine. Use -ge=TOR|SGE|PBS|SLM."
-
-mem_value="${memory_raw//[![:digit:]]/}"
-mem_unit="${memory_raw//[[:digit:]]/}"
-[[ -n "$mem_value" ]] || die "memory must start with a number, e.g. 2G"
-[[ -n "$mem_unit" ]] || die "memory must include a unit, e.g. 2G or 500M"
-
-if [[ "$GE" == "TOR" || "$GE" == "SLM" ]]; then
-    mem_unit="${mem_unit^^}"
-    if [[ "${mem_unit: -1}" != "B" ]]; then
-        mem_unit="${mem_unit}B"
-    fi
-fi
-
-mem_core=$(( (mem_value + cpu - 1) / cpu ))
-is_array=0
-if [[ -n "$array_spec" ]]; then
-    is_array=1
-fi
-
-scriptname="$(mktemp "${TMPDIR:-/tmp}/qsubsh2.XXXXXX")" || die "mktemp failed"
 trap cleanup EXIT
 
-{
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' 'set -o pipefail'
+if [[ $# != 6 ]]; then
+    echo "Error when submitting the job, params: $*"
+    exit 1
+fi
 
-    if [[ "$GE" == "SGE" ]]; then
-        printf '%s\n' "#$ -N ${job_name}"
-        printf '%s\n' '#$ -S /bin/bash'
-        printf '%s\n' '#$ -j y'
-        printf '%s\n' '#$ -o ./job_reports/'
-        printf '%s\n' '#$ -cwd'
-        printf '%s\n' '#$ -V'
-        printf '%s\n' "#$ -pe thread ${cpu}"
-        printf '%s\n' "#$ -l h_vmem=${mem_core}${mem_unit}"
-        if [[ -n "$queue" ]]; then
-            printf '%s\n' "#$ -q ${queue}"
-        fi
-        if [[ -n "$account" ]]; then
-            printf '%s\n' "#$ -A ${account}"
+if [ -z "$4" ]; then
+    echo "No job name"
+    exit 1
+else
+    name=$4
+fi
+
+self_cmd="$0"
+mkdir -p ./job_reports
+today=$(date +%Y.%m.%d_%H.%M.%S)
+todayLOG=$(date +%Y.%m.%d)
+
+additions="$6 ${QSUBSHCOM_EXTRAS}"
+
+GE=$(sed -nr 's/^.*-ge=(\S*)\s?.*$/\1/p' <<< "$additions")
+if [ -z "$GE" ]; then
+    pbs_file=$(command -v qorder)
+    if [[ -n "$pbs_file" ]]; then
+        pbs_folder=$(dirname "$pbs_file")
+        GE="PBS"
+        if [[ -f "$pbs_folder/qchkpt" ]]; then
+            GE="TOR"
         fi
     fi
 
-    if [[ "$GE" == "PBS" || "$GE" == "TOR" ]]; then
-        local_ntype=""
-        if [[ -n "$node_type" ]]; then
-            local_ntype=":NodeType=${node_type}"
-        fi
-        printf '%s\n' "#PBS -N ${job_name}"
-        printf '%s\n' '#PBS -S /bin/bash'
-        printf '%s\n' '#PBS -V'
-        printf '%s\n' "#PBS -l select=1:ncpus=${cpu}${local_ntype}:mem=${mem_value}${mem_unit}"
-        if [[ -n "$walltime" ]]; then
-            printf '%s\n' "#PBS -l walltime=${walltime}"
-        fi
-        if [[ -n "$queue" ]]; then
-            printf '%s\n' "#PBS -q ${queue}"
-        fi
-        if [[ -n "$account" ]]; then
-            printf '%s\n' "#PBS -A ${account}"
-        fi
+    ge_file=$(command -v qsh)
+    if [[ -n "$ge_file" ]]; then
+        GE="SGE"
     fi
 
-    if [[ "$GE" == "SLM" ]]; then
-        printf '%s\n' "#SBATCH --job-name=${job_name}"
-        printf '%s\n' '#SBATCH --ntasks=1'
-        printf '%s\n' "#SBATCH --cpus-per-task=${cpu}"
-        printf '%s\n' "#SBATCH --mem=${mem_value}${mem_unit}"
-        if [[ -n "$walltime" ]]; then
-            printf '%s\n' "#SBATCH --time=${walltime}"
-        fi
-        if [[ -n "$queue" ]]; then
-            printf '%s\n' "#SBATCH --partition=${queue}"
-        fi
-        if [[ -n "$account" ]]; then
-            printf '%s\n' "#SBATCH -A ${account}"
-        fi
+    slm_file=$(command -v sbatch)
+    if [[ -n "$slm_file" ]]; then
+        GE="SLM"
     fi
+fi
 
-    if [[ "$GE" == "PBS" ]]; then
-        if (( is_array == 1 )); then
-            printf '%s\n' "#PBS -o ./job_reports/${job_name}_${today}_A^array_index^.log"
-            printf '%s\n' "#PBS -e ./job_reports/${job_name}_${today}_A^array_index^.err"
-        else
-            printf '%s\n' "#PBS -o ./job_reports/${job_name}_${today}.log"
-            printf '%s\n' "#PBS -e ./job_reports/${job_name}_${today}.err"
-        fi
+if [ -z "$GE" ]; then
+    echo "Sorry, we can't recognize the grid engine"
+    echo "You can use -ge=TOR|SGE|PBS|SLM in the 6th parameter to specify"
+    exit 1
+fi
+
+mem_raw="$3"
+mem=$(printf "%s\n" "${mem_raw//[![:digit:]]/}")
+mem_unit=$(printf "%s\n" "${mem_raw//[[:digit:]]/}")
+if [ -z "$mem_unit" ]; then
+    echo "Sorry, you have to specify the memory unit (3 parameter) in GB or MB or KB"
+    exit 1
+fi
+
+if [ "$GE" == "TOR" ] || [ "$GE" == "SLM" ]; then
+    MEM_UNIT="${mem_unit^^}"
+    if [ "${MEM_UNIT: -1}" != "B" ]; then
+        MEM_UNIT="${MEM_UNIT}B"
     fi
+    mem_unit="$MEM_UNIT"
+fi
 
-    if [[ "$GE" == "TOR" ]]; then
-        if (( is_array == 1 )); then
-            printf '%s\n' "#PBS -o ./job_reports/${job_name}_${today}.submit.log"
-            printf '%s\n' "#PBS -e ./job_reports/${job_name}_${today}.submit.err"
-        else
-            printf '%s\n' "#PBS -o ./job_reports/${job_name}_${today}.log"
-            printf '%s\n' "#PBS -e ./job_reports/${job_name}_${today}.err"
-        fi
+mem_core=$(( (mem + $2 - 1) / $2 ))
+
+ntype=$(sed -nr 's/^.*-ntype=(\S*)\s?.*$/\1/p' <<< "$additions")
+if [[ -n "$ntype" ]]; then
+    ntype=":NodeType=$ntype"
+fi
+
+queue=$(sed -nr 's/^.*-queue=(\S*)\s?.*$/\1/p' <<< "$additions")
+account=$(sed -nr 's/^.*-acct=(\S*)\s?.*$/\1/p' <<< "$additions")
+
+echo '#!/bin/bash' > "$scriptname"
+
+if [ "$GE" == "SGE" ]; then
+    echo "#$ -N ${name}" >> "$scriptname"
+    echo "#$ -S /bin/bash" >> "$scriptname"
+    echo "#$ -j y" >> "$scriptname"
+    echo "#$ -o ./job_reports/" >> "$scriptname"
+    echo "#$ -cwd" >> "$scriptname"
+    echo "#$ -V" >> "$scriptname"
+    echo "#$ -pe thread $2" >> "$scriptname"
+    echo "#$ -l h_vmem=${mem_core}${mem_unit}" >> "$scriptname"
+    echo 'export TASK_ID=${SGE_TASK_ID:-0}' >> "$scriptname"
+fi
+
+if [ "$GE" == "PBS" ] || [ "$GE" == "TOR" ]; then
+    echo "#PBS -N ${name}" >> "$scriptname"
+    echo "#PBS -S /bin/bash" >> "$scriptname"
+    echo "#PBS -V" >> "$scriptname"
+    echo "#PBS -l select=1:ncpus=$2${ntype}:mem=${mem}${mem_unit}" >> "$scriptname"
+    if [ -n "$5" ]; then
+        echo "#PBS -l walltime=$5" >> "$scriptname"
     fi
-
-    if [[ "$GE" == "SLM" ]]; then
-        if (( is_array == 1 )); then
-            printf '%s\n' "#SBATCH -o ./job_reports/${job_name}_${today}_A%a.log"
-            printf '%s\n' "#SBATCH -e ./job_reports/${job_name}_${today}_A%a.err"
-        else
-            printf '%s\n' "#SBATCH -o ./job_reports/${job_name}_${today}.log"
-            printf '%s\n' "#SBATCH -e ./job_reports/${job_name}_${today}.err"
-        fi
+    if [[ -n "$queue" ]]; then
+        echo "#PBS -q $queue" >> "$scriptname"
     fi
-
-    if [[ "$GE" == "PBS" || "$GE" == "TOR" ]]; then
-        printf '%s\n' 'cd "${PBS_O_WORKDIR:-$PWD}"'
-        printf '%s\n' 'export JOB_ID="${PBS_JOBID:-}"'
-        printf '%s\n' 'export TASK_ID="${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-0}}"'
-    elif [[ "$GE" == "SGE" ]]; then
-        printf '%s\n' 'export JOB_ID="${JOB_ID:-}"'
-        printf '%s\n' 'export TASK_ID="${SGE_TASK_ID:-0}"'
-    elif [[ "$GE" == "SLM" ]]; then
-        printf '%s\n' 'export JOB_ID="${SLURM_JOB_ID:-}"'
-        printf '%s\n' 'export TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"'
+    if [[ -n "$account" ]]; then
+        echo "#PBS -A $account" >> "$scriptname"
     fi
+fi
 
-    if [[ "$GE" == "TOR" && "$is_array" -eq 1 ]]; then
-        printf '%s\n' "exec > \"./job_reports/${job_name}_${today}_A\${TASK_ID}.log\" 2> \"./job_reports/${job_name}_${today}_A\${TASK_ID}.err\""
+if [ "$GE" == "SLM" ]; then
+    echo "#SBATCH --job-name=${name}" >> "$scriptname"
+    echo "#SBATCH --ntasks=1" >> "$scriptname"
+    echo "#SBATCH --cpus-per-task=$2" >> "$scriptname"
+    echo "#SBATCH --mem=${mem}${mem_unit}" >> "$scriptname"
+    if [ -n "$5" ]; then
+        echo "#SBATCH --time=$5" >> "$scriptname"
     fi
+    if [[ -n "$queue" ]]; then
+        echo "#SBATCH --partition $queue" >> "$scriptname"
+    fi
+    if [[ -n "$account" ]]; then
+        echo "#SBATCH -A $account" >> "$scriptname"
+    fi
+fi
 
-    printf '%s\n' 'echo "Job ID: ${JOB_ID:-}"'
-    printf '%s\n' 'echo "Array ID: ${TASK_ID:-}"'
-    printf '%s\n' "cat <<'EOF'"
-    printf '%s\n' "PARAM to here: $*"
-    printf '%s\n' 'EOF'
-    printf '%s\n' 'echo ""'
-    printf '%s\n' 'echo ========QSUB STD out========'
-
-    if (( is_array == 1 )); then
-        printf '%s\n' "mlog=\"./job_reports/${job_name}_${today}_A\${TASK_ID}.mon\""
+isArray=0
+if [ "$GE" == "PBS" ]; then
+    if [[ "$additions" =~ ^.*-array.*$ ]]; then
+        echo "#PBS -o ./job_reports/${name}_${today}_A^array_index^.log" >> "$scriptname"
+        echo "#PBS -e ./job_reports/${name}_${today}_A^array_index^.err" >> "$scriptname"
+        isArray=1
     else
-        printf '%s\n' "mlog=\"./job_reports/${job_name}_${today}.mon\""
+        echo "#PBS -o ./job_reports/${name}_${today}.log" >> "$scriptname"
+        echo "#PBS -e ./job_reports/${name}_${today}.err" >> "$scriptname"
     fi
-    printf '%s\n' 'tMon=10'
+fi
 
-    cat <<'EOF'
+if [ "$GE" == "TOR" ]; then
+    if [[ "$additions" =~ ^.*-array.*$ ]]; then
+        echo "#PBS -o ./job_reports/${name}_${today}.submit.log" >> "$scriptname"
+        echo "#PBS -e ./job_reports/${name}_${today}.submit.err" >> "$scriptname"
+        isArray=1
+    else
+        echo "#PBS -o ./job_reports/${name}_${today}.log" >> "$scriptname"
+        echo "#PBS -e ./job_reports/${name}_${today}.err" >> "$scriptname"
+    fi
+fi
+
+if [ "$GE" == "SLM" ]; then
+    if [[ "$additions" =~ ^.*-array.*$ ]]; then
+        echo "#SBATCH -o ./job_reports/${name}_${today}_A%a.log" >> "$scriptname"
+        echo "#SBATCH -e ./job_reports/${name}_${today}_A%a.err" >> "$scriptname"
+        isArray=1
+    else
+        echo "#SBATCH -o ./job_reports/${name}_${today}.log" >> "$scriptname"
+        echo "#SBATCH -e ./job_reports/${name}_${today}.err" >> "$scriptname"
+    fi
+fi
+
+if [ "$GE" == "PBS" ] || [ "$GE" == "TOR" ]; then
+    echo 'cd "${PBS_O_WORKDIR:-$PWD}"' >> "$scriptname"
+    echo 'export JOB_ID=${PBS_JOBID}' >> "$scriptname"
+    echo 'export TASK_ID=${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-0}}' >> "$scriptname"
+fi
+
+if [ "$GE" == "SLM" ]; then
+    echo 'export JOB_ID=${SLURM_JOB_ID}' >> "$scriptname"
+    echo 'export TASK_ID=${SLURM_ARRAY_TASK_ID:-0}' >> "$scriptname"
+fi
+
+if [ "$GE" == "TOR" ] && [ "$isArray" -eq 1 ]; then
+    echo "exec > \"./job_reports/${name}_${today}_A\${TASK_ID}.log\" 2> \"./job_reports/${name}_${today}_A\${TASK_ID}.err\"" >> "$scriptname"
+fi
+
+echo 'echo "Job ID: ${JOB_ID}"' >> "$scriptname"
+echo 'echo "Array ID: ${TASK_ID}"' >> "$scriptname"
+
+{
+    echo "cat << 'EOF'"
+    echo " PARAM to here: $* "
+    echo "EOF"
+} >> "$scriptname"
+
+echo 'echo ""' >> "$scriptname"
+echo 'echo ========QSUB STD out========' >> "$scriptname"
+
+if [ "$isArray" -eq 1 ]; then
+    echo "mlog=\"./job_reports/${name}_${today}_A\${TASK_ID}.mon\"" >> "$scriptname"
+else
+    echo "mlog=\"./job_reports/${name}_${today}.mon\"" >> "$scriptname"
+fi
+echo "tMon=10" >> "$scriptname"
+
+cat <<'EOF' >> "$scriptname"
 collect_child_pids() {
     local parent_pid="$1"
-    local child_pid=""
-
-    while IFS= read -r child_pid; do
-        [[ -n "$child_pid" ]] || continue
-        echo "$child_pid"
-        collect_child_pids "$child_pid"
+    local child=""
+    while IFS= read -r child; do
+        [[ -n "$child" ]] || continue
+        echo "$child"
+        collect_child_pids "$child"
     done < <(pgrep -P "$parent_pid" 2>/dev/null || true)
 }
 
 sum_res_pids() {
-    local root_pid="$1"
+    local runid1="$1"
     local temp_file=""
-    local child_pid=""
-    local pid=""
-    local stats=""
-    local vmhwm=""
+    local curid1=""
+    local pp=""
+    local vmpeak=""
     local etime=""
-    local result=""
-    local pids=("$root_pid")
+    local res=""
+    local pids=( "$runid1" )
 
-    temp_file="$(mktemp)"
+    temp_file=$(mktemp)
 
-    while IFS= read -r child_pid; do
-        [[ -n "$child_pid" ]] && pids+=("$child_pid")
-    done < <(collect_child_pids "$root_pid")
+    while IFS= read -r curid1; do
+        [[ -n "$curid1" ]] && pids+=( "$curid1" )
+    done < <(collect_child_pids "$runid1")
 
-    etime="$(ps --no-headers -o etimes= -p "$root_pid" 2>/dev/null | awk 'NR==1 { print $1 + 0 }')"
+    etime=$(ps --no-header -o etimes= -p "$runid1" 2>/dev/null | awk 'NR==1 {print $1+0}')
+    if [ -z "$etime" ]; then
+        etime=0
+    fi
 
-    for pid in "${pids[@]}"; do
-        stats="$(ps --no-headers -o cputimes=,pcpu=,rss=,vsz= -p "$pid" 2>/dev/null | awk 'NF { print $1, $2, $3, $4 }')"
-        [[ -n "$stats" ]] || continue
+    for curid1 in "${pids[@]}"; do
+        pp=$(ps --no-header -o cputimes=,pcpu=,rss=,vsz= -p "$curid1" 2>/dev/null | awk 'NF {print $1, $2, $3, $4}')
+        [[ -n "$pp" ]] || continue
 
-        if [[ -r "/proc/$pid/status" ]]; then
-            vmhwm="$(awk '/VmHWM:/ { print $2; exit }' "/proc/$pid/status")"
+        if [[ -r "/proc/$curid1/status" ]]; then
+            vmpeak=$(awk '/VmHWM:/ {print $2; exit}' "/proc/$curid1/status")
         else
-            vmhwm=0
+            vmpeak=0
         fi
-
-        printf '%s %s\n' "$stats" "${vmhwm:-0}" >> "$temp_file"
+        echo "$pp ${vmpeak:-0}" >> "$temp_file"
     done
 
     if [[ -s "$temp_file" ]]; then
-        result="$(
-            awk '
-                {
-                    sum_cpu += $1
-                    sum_pcpu += $2
-                    sum_rss += $3
-                    sum_vsz += $4
-                    sum_vmhwm += $5
-                }
-                END {
-                    printf "%d\t%.2f\t%d\t%d\t%d", sum_cpu, sum_pcpu, sum_rss, sum_vsz, sum_vmhwm
-                }
-            ' "$temp_file"
-        )"
+        res=$(awk '
+            {
+                sum1 += $1
+                sum2 += $2
+                sum3 += $3
+                sum4 += $4
+                sum5 += $5
+            }
+            END {
+                printf "%d\t%.2f\t%d\t%d\t%d", sum1, sum2, sum3, sum4, sum5
+            }
+        ' "$temp_file")
     else
-        result=$'0\t0.00\t0\t0\t0'
+        res=$'0\t0.00\t0\t0\t0'
     fi
 
     rm -f "$temp_file"
-    printf '%s\t%s\n' "${etime:-0}" "$result"
+    echo -e "$etime\t$res"
 }
 
 monitor() {
     local interval="$1"
     local logfile="$2"
-    local monitor_pid="$BASHPID"
-    local shell_pid="$$"
-    local parent_pid="$PPID"
-    local count_child=0
-    local run_pids=()
-    local pid=""
-    local comm=""
-    local time_now=""
+    local mid=$BASHPID
+    local curid=$$
+    local ppid=$PPID
+    local timeNow=""
+    local countChild=0
+    local runct=0
+    local runid=""
 
     echo "Task start: $(date +%T)" > "$logfile"
-    echo "\$BASHPID: $monitor_pid" >> "$logfile"
-    echo "\$\$: $shell_pid" >> "$logfile"
-    echo "\$PPID: $parent_pid" >> "$logfile"
+    echo "\$BASHPID: $mid" >> "$logfile"
+    echo "\$\$: $curid" >> "$logfile"
+    echo "\$PPID: $ppid" >> "$logfile"
     echo "" >> "$logfile"
     echo -e "Time\tELAPSED\tCPU_SECONDS\t%CPU\tRSS\tVSZ\tVmHWM" >> "$logfile"
 
     while true; do
-        time_now="$(date +%T)"
-        count_child=0
-
-        while read -r pid comm; do
-            [[ -n "$pid" ]] && ((count_child++))
-        done < <(ps --no-headers -o pid=,comm= --ppid "$parent_pid" 2>/dev/null)
-
-        if (( count_child == 0 )); then
+        timeNow="$(date +%T)"
+        countChild=$(ps --no-headers -o pid= --ppid "$ppid" 2>/dev/null | sed '/^\s*$/d' | wc -l)
+        if [ "$countChild" -eq 0 ]; then
             echo "" >> "$logfile"
             echo "Task finished: $(date +%T)" >> "$logfile"
             break
         fi
 
-        run_pids=()
-        while read -r pid comm; do
-            [[ -n "$pid" && "$pid" != "$monitor_pid" ]] && run_pids+=("$pid")
-        done < <(ps --no-headers -o pid=,comm= --ppid "$shell_pid" 2>/dev/null)
-
-        if (( ${#run_pids[@]} == 1 )); then
-            printf '%s\t%s\n' "$time_now" "$(sum_res_pids "${run_pids[0]}")" >> "$logfile"
-        elif (( ${#run_pids[@]} == 0 )); then
-            echo "$time_now: No job" >> "$logfile"
+        runct=$(ps --no-headers -o pid= --ppid "$curid" 2>/dev/null | grep -vw "$mid" | sed '/^\s*$/d' | wc -l)
+        if [ "$runct" -eq 1 ]; then
+            runid=$(ps --no-headers -o pid= --ppid "$curid" 2>/dev/null | grep -vw "$mid" | awk 'NR==1 {print $1}')
+            echo -e "$timeNow\t$(sum_res_pids "$runid")" >> "$logfile"
+        elif [ "$runct" -eq 0 ]; then
+            echo "$timeNow: No job" >> "$logfile"
         else
-            echo "$time_now: multiple job" >> "$logfile"
-            ps --no-headers -o pid=,comm= --ppid "$shell_pid" >> "$logfile"
+            echo "$timeNow: multiple job" >> "$logfile"
+            ps --no-headers -o pid=,comm= --ppid "$curid" >> "$logfile"
         fi
 
         sleep "$interval"
@@ -500,157 +322,155 @@ monitor() {
 monitor "$tMon" "$mlog" &
 EOF
 
-    printf '%s\n' "export OMP_NUM_THREADS=${cpu}"
-    printf '%s\n' "export OPENBLAS_NUM_THREADS=${cpu}"
-    printf '%s\n' "export MKL_NUM_THREADS=${cpu}"
-    printf '%s\n' "export NUMEXPR_NUM_THREADS=${cpu}"
-    sed 's/\$\?{TASK_ID}/${TASK_ID}/g; s/[[:space:]]*|;[[:space:]]*/\
-/g' <<< "$command_string"
-    printf '%s\n' 'echo =========QSUB STD end========='
-    printf '%s\n' 'echo ""'
-} > "$scriptname"
+echo "export OMP_NUM_THREADS=$2" >> "$scriptname"
+sed "s/\$\?{TASK_ID}/\${TASK_ID}/g" <<< "$1" | sed "s/\s*|;\s*/\n/g" >> "$scriptname"
+echo 'echo =========QSUB STD end=========' >> "$scriptname"
+echo 'echo ""' >> "$scriptname"
+echo 'echo ""' >> "$scriptname"
+echo 'echo ""' >> "$scriptname"
+echo 'echo ""' >> "$scriptname"
+echo 'echo ""' >> "$scriptname"
 
-submit_cmd=(qsub)
-if [[ "$GE" == "SLM" ]]; then
-    submit_cmd=(sbatch)
-fi
+params=$scriptname
+log=""
+if [ -n "$additions" ]; then
+    raw_param=$additions
+    wait_jb=$(sed -nr 's/^.*-wait=(\S*)\s?.*$/\1/p' <<< "$raw_param")
+    arrays=$(sed -nr 's/^.*-array=(\S*)\s?.*$/\1/p' <<< "$raw_param")
+    log=$(sed -nr 's/^.*-log=(\S*)\s?.*$/\1/p' <<< "$raw_param")
+    remain_param=$(echo "$raw_param" | sed 's/-ge=\S*//g' | sed 's/-log=\S*//g' | sed 's/-wait=\S*//g' | sed 's/-array=\S*//g' | sed 's/-ntype=\S*//g' | sed 's/-queue=\S*//g' | sed 's/-acct=\S*//g')
 
-submit_params=()
-
-case "$GE" in
-    PBS)
-        if [[ -n "$array_spec" ]]; then
-            submit_params+=("-J" "$array_spec")
+    if [ "$GE" == "PBS" ]; then
+        if [[ -n "$arrays" ]]; then
+            params="-J $arrays $params"
         fi
-        if [[ -n "$wait_jobs" ]]; then
-            wait_list=()
-            IFS=':' read -r -a jobs <<< "$wait_jobs"
+        if [[ -n "$wait_jb" ]]; then
+            wait_list=""
+            IFS=':' read -ra jobs <<< "$wait_jb"
             for job in "${jobs[@]}"; do
-                if job_exists "$GE" "$job"; then
-                    wait_list+=("$job")
-                else
-                    warn "PBS dependency job not found, skipping: $job"
+                if qstat -f "$job" >/dev/null 2>&1; then
+                    wait_list="$wait_list:$job"
                 fi
             done
-            if (( ${#wait_list[@]} > 0 )); then
-                dep='depend=afterok'
-                for job in "${wait_list[@]}"; do
-                    dep="${dep}:${job}"
-                done
-                submit_params+=("-W" "$dep")
+            if [[ -n "$wait_list" ]]; then
+                params="-W depend=afterok$wait_list $params"
             fi
         fi
-        ;;
-    SGE)
-        if [[ -n "$array_spec" ]]; then
-            submit_params+=("-t" "$array_spec")
+    elif [ "$GE" == "SGE" ]; then
+        if [[ -n "$arrays" ]]; then
+            params="-t $arrays $params"
         fi
-        if [[ -n "$wait_jobs" ]]; then
-            submit_params+=("-hold_jid" "${wait_jobs//:/,}")
+        if [[ -n "$wait_jb" ]]; then
+            wait_jb=$(sed 's/:/,/g' <<< "$wait_jb")
+            params="-hold_jid $wait_jb $params"
         fi
-        ;;
-    TOR)
-        if [[ -n "$array_spec" ]]; then
-            submit_params+=("-t" "$array_spec")
+    elif [ "$GE" == "TOR" ]; then
+        if [[ -n "$arrays" ]]; then
+            params="-t $arrays $params"
         fi
-        if [[ -n "$wait_jobs" ]]; then
-            wait_list=()
-            IFS=':' read -r -a jobs <<< "$wait_jobs"
+        if [[ -n "$wait_jb" ]]; then
+            wait_list=""
+            IFS=':' read -ra jobs <<< "$wait_jb"
             for job in "${jobs[@]}"; do
-                if ! job_exists "$GE" "$job"; then
-                    warn "Torque dependency job not found, skipping: $job"
-                    continue
-                fi
-
-                if [[ "$job" == *"[]"* ]]; then
-                    if bridge_job_id="$(submit_torque_array_bridge "$job" "$self_path" "${remaining_submit_params[@]}")"; then
-                        wait_list+=("$bridge_job_id")
+                if qstat -f "$job" >/dev/null 2>&1; then
+                    if [[ $job == *"[]"* ]]; then
+                        job_id=$("$self_cmd" "echo torque-array-wait-bridge" 1 10MB qwait_ar 00:00:30 "-W depend=afterokarray:$job $remain_param" 2>/dev/null)
+                        if [[ -n "$job_id" ]]; then
+                            wait_list="$wait_list:$job_id"
+                        fi
                     else
-                        warn "Torque array dependency bridge failed for: $job"
+                        wait_list="$wait_list:$job"
                     fi
-                else
-                    wait_list+=("$job")
                 fi
             done
-            if (( ${#wait_list[@]} > 0 )); then
-                dep='depend=afterok'
-                for job in "${wait_list[@]}"; do
-                    dep="${dep}:${job}"
-                done
-                submit_params+=("-W" "$dep")
+            if [[ -n "$wait_list" ]]; then
+                params="-W depend=afterok$wait_list $params"
             fi
         fi
-        ;;
-    SLM)
-        if [[ -n "$array_spec" ]]; then
-            submit_params+=("--array=${array_spec}")
+    elif [ "$GE" == "SLM" ]; then
+        if [[ -n "$arrays" ]]; then
+            params="--array=$arrays $params"
         fi
-        if [[ -n "$wait_jobs" ]]; then
-            wait_list=()
-            IFS=':' read -r -a jobs <<< "$wait_jobs"
+        if [[ -n "$wait_jb" ]]; then
+            wait_list=""
+            IFS=':' read -ra jobs <<< "$wait_jb"
             for job in "${jobs[@]}"; do
-                if job_exists "$GE" "$job"; then
-                    wait_list+=("$job")
-                else
-                    warn "Slurm dependency job not found, skipping: $job"
+                if squeue -h -j "$job" 2>/dev/null | grep -q .; then
+                    wait_list="$wait_list:$job"
                 fi
             done
-            if (( ${#wait_list[@]} > 0 )); then
-                dep='afterok'
-                for job in "${wait_list[@]}"; do
-                    dep="${dep}:${job}"
-                done
-                submit_params+=("--dependency=${dep}")
+            if [[ -n "$wait_list" ]]; then
+                params="--dependency=afterok$wait_list $params"
             fi
         fi
-        ;;
-esac
-
-if (( ${#remaining_submit_params[@]} > 0 )); then
-    submit_params+=("${remaining_submit_params[@]}")
+    fi
+    params="$remain_param $params"
 fi
-submit_params+=("$scriptname")
 
-if [[ -z "$log_stem" ]]; then
-    submit_log="qsub.${today_log}.log"
+submit_pretty=""
+if [ "$GE" == "SLM" ]; then
+    submit_pretty="sbatch $params"
 else
-    submit_log="${log_stem}.${today_log}.log"
+    submit_pretty="qsub $params"
 fi
 
-printf -v submit_pretty '%q ' "${submit_cmd[@]}" "${submit_params[@]}"
-submit_pretty="${submit_pretty% }"
-
-if ! submit_output="$("${submit_cmd[@]}" "${submit_params[@]}" 2>&1)"; then
-    {
-        echo "$job_name"
-        echo "QSUB_TIME: $today"
-        echo "QSUB_STATUS: FAILED"
-        echo "QSUB_OUT: $submit_output"
-        echo "QSUB_PARAMS: $*"
-        echo "QSUB_SUBMIT: $submit_pretty"
-        echo "-----------------------------"
-        echo ""
-    } >> "$submit_log"
-    printf '%s\n' "$submit_output" >&2
-    exit 1
-fi
-
-job_id="$(parse_job_id "$GE" "$submit_output")"
-if [[ -z "$job_id" ]]; then
-    warn "Unable to parse job id from submit output"
-    job_id="$submit_output"
+if [ -z "$log" ]; then
+    log="qsub.$todayLOG.log"
+else
+    log="$log.$todayLOG.log"
 fi
 
 {
-    echo "$job_name"
+    echo "$name"
     echo "QSUB_TIME: $today"
-    echo "QSUB_STATUS: OK"
-    echo "QSUB_OUT: $submit_output"
-    echo "QSUB_JOB_ID: $job_id"
     echo "QSUB_PARAMS: $*"
     echo "QSUB_SUBMIT: $submit_pretty"
-    echo "-----------------------------"
-    echo ""
-} >> "$submit_log"
+} >> "$log"
 
-printf '%s\n' "$job_id"
+if [ "$GE" == "SLM" ]; then
+    output=$(sbatch $params 2>&1)
+    submit_status=$?
+else
+    output=$(qsub $params 2>&1)
+    submit_status=$?
+fi
+
+echo "QSUB_OUT: $output" >> "$log"
+
+if [ "$submit_status" -ne 0 ]; then
+    echo "QSUB_STATUS: FAILED" >> "$log"
+    echo "-----------------------------" >> "$log"
+    echo " " >> "$log"
+    echo "$output" >&2
+    exit "$submit_status"
+fi
+
+echo "QSUB_STATUS: OK" >> "$log"
+printf "QSUB_JOB_ID: " >> "$log"
+
+if [ "$GE" == "SGE" ]; then
+    job_id=$(echo "$output" | sed -r 's/Your (job|job-array) ([0-9]*).*/\2/')
+    echo "$job_id"
+    echo "$job_id" >> "$log"
+fi
+
+if [ "$GE" == "PBS" ]; then
+    job_id="$output"
+    echo "$job_id"
+    echo "$job_id" >> "$log"
+fi
+
+if [ "$GE" == "TOR" ]; then
+    job_id=$(echo "$output" | tail -n 1 | tr -d '\n')
+    echo "$job_id"
+    echo "$job_id" >> "$log"
+fi
+
+if [ "$GE" == "SLM" ]; then
+    job_id=$(echo "$output" | sed -r 's/.* ([0-9]*).*/\1/g')
+    echo "$job_id"
+    echo "$job_id" >> "$log"
+fi
+
+echo "-----------------------------" >> "$log"
+echo " " >> "$log"
