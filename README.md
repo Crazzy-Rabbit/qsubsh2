@@ -2,7 +2,7 @@
 
 A simple job submitter for PBS Pro, Torque, SGE and Slurm.
 
-`qsubsh2.sh` detects the cluster type automatically and submits jobs with the correct backend command without making you rewrite scheduler-specific headers such as `#PBS` or `#SBATCH`. It keeps the same calling style as classic [qsubshcom](https://github.com/zhilizheng/qsubshcom), but improves submission failure handling, submission logging, temporary script cleanup, and runtime resource monitoring.
+`qsubsh2` detects the cluster type automatically and submits jobs with the correct backend command without making you rewrite scheduler-specific headers such as `#PBS` or `#SBATCH`. It keeps the same calling style as classic [qsubshcom](https://github.com/zhilizheng/qsubshcom), but improves submission failure handling, submission logging, temporary script cleanup, and runtime resource monitoring.
 
 It is designed for the common workflow of:
 
@@ -12,18 +12,18 @@ It is designed for the common workflow of:
 - keeping a submission history in the working directory
 - collecting stdout, stderr, and lightweight resource monitoring under `./job_reports`
 
-Author: Zhili-inspired workflow, adapted version for `qsubsh2.sh`  
+Author: Zhili-inspired workflow, adapted version for `qsubsh2`  
 License: MIT-style workflow reference, adjust to your repository license as needed.
 
 ## Installation
 
-Clone this repository or copy `qsubsh2.sh` to a location in your `PATH`.
+Clone this repository or copy `qsubsh2` to a location in your `PATH`.
 
 ```bash
-chmod +x qsubsh2.sh
+chmod +x qsubsh2
 
 # optional: put it somewhere in PATH
-cp qsubsh2.sh ~/bin/qsubsh2
+cp qsubsh2 ~/bin/qsubsh2
 
 # test the command
 qsubsh2 "echo hello" 1 1G demo 00:01:00 ""
@@ -32,13 +32,13 @@ qsubsh2 "echo hello" 1 1G demo 00:01:00 ""
 If you prefer to run it locally from the repository:
 
 ```bash
-./qsubsh2.sh "echo hello" 1 1G demo 00:01:00 ""
+./qsubsh2 "echo hello" 1 1G demo 00:01:00 ""
 ```
 
 ## Usage
 
 ```bash
-# qsubsh2.sh "command1 |; command2" num_CPU total_memory task_name run_time other_params
+# qsubsh2 "command1 |; command2" num_CPU total_memory task_name run_time other_params
 # logs go to:
 #   ./job_reports/*.log   stdout
 #   ./job_reports/*.err   stderr
@@ -50,7 +50,7 @@ If you prefer to run it locally from the repository:
 The interface is intentionally unchanged from the older style:
 
 ```bash
-qsubsh2.sh "echo 'hello world'" 1 1G helloTask 1:00:00 ""
+qsubsh2 "echo 'hello world'" 1 1G helloTask 1:00:00 ""
 ```
 
 ## Common Calling Patterns
@@ -58,7 +58,7 @@ qsubsh2.sh "echo 'hello world'" 1 1G helloTask 1:00:00 ""
 ### Submit a single command
 
 ```bash
-qsubsh2.sh "echo 'hello world'" 1 1G helloTask 1:00:00 ""
+qsubsh2 "echo 'hello world'" 1 1G helloTask 1:00:00 ""
 ```
 
 ### Submit multiple commands in one job
@@ -66,27 +66,27 @@ qsubsh2.sh "echo 'hello world'" 1 1G helloTask 1:00:00 ""
 Use `|;` to split commands into separate lines in the generated job script.
 
 ```bash
-qsubsh2.sh "echo 'step1' |; echo 'step2' |; echo 'step3'" 1 1G multiStep 1:00:00 ""
+qsubsh2 "echo 'step1' |; echo 'step2' |; echo 'step3'" 1 1G multiStep 1:00:00 ""
 ```
 
 ### Run an existing shell script
 
 ```bash
-qsubsh2.sh "bash test_script.sh" 1 1G demoSh 1:00:00 ""
+qsubsh2 "bash test_script.sh" 1 1G demoSh 1:00:00 ""
 ```
 
 You can also run it directly if it is executable:
 
 ```bash
-qsubsh2.sh "./test_script.sh" 1 1G demoSh 1:00:00 ""
+qsubsh2 "./test_script.sh" 1 1G demoSh 1:00:00 ""
 ```
 
 ### Run Python or R
 
 ```bash
-qsubsh2.sh "python3 test.py" 1 1G demoPy 1:00:00 ""
+qsubsh2 "python3 test.py" 1 1G demoPy 1:00:00 ""
 
-qsubsh2.sh "Rscript test.R --chr={TASK_ID}" 1 1G demoR 1:00:00 "-array=1-22"
+qsubsh2 "Rscript test.R --chr={TASK_ID}" 1 1G demoR 1:00:00 "-array=1-22"
 ```
 
 ### Run a job array
@@ -94,34 +94,36 @@ qsubsh2.sh "Rscript test.R --chr={TASK_ID}" 1 1G demoR 1:00:00 "-array=1-22"
 `{TASK_ID}` is replaced with the scheduler-specific array index variable at runtime.
 
 ```bash
-qsubsh2.sh "echo 'hello world {TASK_ID}' > {TASK_ID}.log" 1 1G helloArray 1:00:00 "-array=1-10"
+qsubsh2 "echo 'hello world {TASK_ID}' > {TASK_ID}.log" 1 1G helloArray 1:00:00 "-array=1-10"
 ```
 
 ### Chain jobs with dependencies
 
 ```bash
-job1=$(qsubsh2.sh "echo 'hello world 1'" 1 1G helloTask1 1:00:00 "")
-job2=$(qsubsh2.sh "echo 'hello world 2'" 1 1G helloTask2 1:00:00 "")
+job1=$(qsubsh2 "echo 'hello world 1'" 1 1G helloTask1 1:00:00 "")
+job2=$(qsubsh2 "echo 'hello world 2'" 1 1G helloTask2 1:00:00 "")
 
-job3=$(qsubsh2.sh "echo 'hello again'" 1 1G helloTask3 1:00:00 "-wait=$job1:$job2")
+job3=$(qsubsh2 "echo 'hello again'" 1 1G helloTask3 1:00:00 "-wait=$job1:$job2")
 
-qsubsh2.sh "echo 'array task {TASK_ID}' > out_{TASK_ID}.txt" 1 1G helloTask4 1:00:00 "-wait=$job3 -array=1-10"
+qsubsh2 "echo 'array task {TASK_ID}' > out_{TASK_ID}.txt" 1 1G helloTask4 1:00:00 "-wait=$job3 -array=1-10"
 ```
 
 ### Specify queue, account, or engine manually
 
 ```bash
-qsubsh2.sh "python3 test.py" 4 8G myJob 12:00:00 "-queue=batch -acct=my_project"
+qsubsh2 "python3 test.py" 4 8G myJob 12:00:00 "-queue=batch -acct=my_project"
 
-qsubsh2.sh "python3 test.py" 4 8G myJob 12:00:00 "-ge=SLM"
+qsubsh2 "python3 test.py" 4 8G myJob 12:00:00 "-ge=SLM"
 ```
 
 ### Pass scheduler-native extra parameters
 
-Any extra parameters that are not reserved by `qsubsh2.sh` are passed through to `qsub` or `sbatch`.
+Any extra parameters that are not reserved by `qsubsh2` are passed through to `qsub` or `sbatch`.
 
 ```bash
-qsubsh2.sh "hostname" 1 1G hostCheck 00:10:00 "-l host=host1:host2"
+qsubsh2 "hostname" 1 1G hostCheck 00:10:00 "-l host=host1:host2"
+
+qsubsh2 "python3 test.py" 4 8G myJob 12:00:00 "--partition long --qos normal"
 ```
 
 Note: these backend-specific parameters may not work across different cluster engines.
@@ -131,10 +133,10 @@ Note: these backend-specific parameters may not work across different cluster en
 If you already have scripts, you can submit them as normal commands:
 
 ```bash
-qsubsh2.sh "bash Your_script.sh" 2 4G your_task_name 10:00:00 ""
+qsubsh2 "bash Your_script.sh" 2 4G your_task_name 10:00:00 ""
 ```
 
-`qsubsh2.sh` submits a generated wrapper script from the current working directory, so an extra `cd WORK_DIR` is usually unnecessary.
+`qsubsh2` submits a generated wrapper script from the current working directory, so an extra `cd WORK_DIR` is usually unnecessary.
 
 If your original script contains scheduler-specific variables such as `${PBS_ARRAY_INDEX}` or `${SLURM_ARRAY_TASK_ID}`, replace them with `${TASK_ID}` when you want the same script to run across supported cluster types.
 
@@ -146,7 +148,7 @@ A practical pattern is to store the command in a temporary shell variable first:
 
 ```bash
 temp_command="awk '{print \$1, \$2}' test.txt > test2.txt"
-qsubsh2.sh "$temp_command" 1 1G test_awk 00:00:05 ""
+qsubsh2 "$temp_command" 1 1G test_awk 00:00:05 ""
 ```
 
 ## Memory
@@ -156,7 +158,7 @@ The memory argument is the total memory requested for the task, not per CPU core
 For example:
 
 ```bash
-qsubsh2.sh "echo hello" 3 5G test 00:00:05 ""
+qsubsh2 "echo hello" 3 5G test 00:00:05 ""
 ```
 
 requests 3 CPU cores and 5 GB memory in total.
@@ -167,7 +169,7 @@ Use memory values like `1G`, `500M`, or `100K`. Avoid `GB` and `MB` because some
 
 ## Logs
 
-`qsubsh2.sh` writes logs in two places:
+`qsubsh2` writes logs in two places:
 
 - `./qsub.YYYY.MM.DD.log`: submission history, submit command, raw scheduler output, and parsed job id
 - `./job_reports/`: runtime logs for each job
@@ -221,16 +223,16 @@ genoQC1="extract_chr{TASK_ID}"
 assocOut="test_assoc_chr{TASK_ID}"
 
 cmd1="plink2 --bfile $geno --extract $snplist --make-bed --out $genoQC1"
-pid1=$(qsubsh2.sh "$cmd1" 2 5G QC1 10:00:00 "-array=$chrs")
+pid1=$(qsubsh2 "$cmd1" 2 5G QC1 10:00:00 "-array=$chrs")
 
-pid2=$(qsubsh2.sh "plink2 --bfile $genoQC1 --pheno $pheno --linear --out $assocOut" 2 5G assoc 10:00:00 "-array=$chrs -wait=$pid1")
+pid2=$(qsubsh2 "plink2 --bfile $genoQC1 --pheno $pheno --linear --out $assocOut" 2 5G assoc 10:00:00 "-array=$chrs -wait=$pid1")
 
-qsubsh2.sh "Rscript test.R {TASK_ID}" 1 2G enrich 10:00:00 "-array=$chrs -wait=$pid2"
+qsubsh2 "Rscript test.R {TASK_ID}" 1 2G enrich 10:00:00 "-array=$chrs -wait=$pid2"
 ```
 
 ## What Changed Relative to Older qsubshcom-Style Usage
 
-The calling interface stays the same, but `qsubsh2.sh` improves a few operational details:
+The calling interface stays the same, but `qsubsh2` improves a few operational details:
 
 - submission failures are logged clearly and return a non-zero exit code
 - submission logs include the expanded backend submit command
