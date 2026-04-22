@@ -135,7 +135,7 @@ The real-time monitor records resource consumption every 10 seconds, including e
 If submission fails, the failure is also written into the submit log and the script exits with a non-zero status.
 
 ## Update
-
+Apr 22, 2026: Fixed the real-time monitor on Linux clusters.
 Apr 21, 2026: Kept the original `qsubshcom` calling style, while improving submit failure logging, temporary file cleanup, and CPU time accounting in monitor logs.
 
 ## Issues
