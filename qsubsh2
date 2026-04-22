@@ -216,20 +216,66 @@ cat <<'EOF' >> "$scriptname"
 collect_child_pids() {
     local parent_pid="$1"
     local child=""
-    while IFS= read -r child; do
-        [[ -n "$child" ]] || continue
-        echo "$child"
-        collect_child_pids "$child"
-    done < <(pgrep -P "$parent_pid" 2>/dev/null || true)
+    if command -v pgrep >/dev/null 2>&1; then
+        while IFS= read -r child; do
+            [[ -n "$child" ]] || continue
+            echo "$child"
+            collect_child_pids "$child"
+        done < <(pgrep -P "$parent_pid" 2>/dev/null || true)
+    else
+        local status_file=""
+        local maybe_pid=""
+        local maybe_ppid=""
+        for status_file in /proc/[0-9]*/status; do
+            [[ -r "$status_file" ]] || continue
+            maybe_pid="${status_file%/status}"
+            maybe_pid="${maybe_pid##*/}"
+            maybe_ppid="$(awk '/^PPid:/ { print $2; exit }' "$status_file" 2>/dev/null)"
+            if [[ "$maybe_ppid" == "$parent_pid" ]]; then
+                echo "$maybe_pid"
+                collect_child_pids "$maybe_pid"
+            fi
+        done
+    fi
+}
+
+read_proc_metrics() {
+    local pid="$1"
+    local stat_line=""
+    local stat_tail=""
+    local utime=0
+    local stime=0
+    local vsize=0
+    local rss_pages=0
+    local vmhwm=0
+
+    [[ -r "/proc/$pid/stat" ]] || return 1
+
+    stat_line="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    stat_tail="${stat_line#*) }"
+    set -- $stat_tail
+
+    utime="${12:-0}"
+    stime="${13:-0}"
+    vsize="${21:-0}"
+    rss_pages="${22:-0}"
+
+    if [[ -r "/proc/$pid/status" ]]; then
+        vmhwm="$(awk '/VmHWM:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null)"
+    fi
+
+    printf '%s %s %s %s\n' \
+        "$((utime + stime))" \
+        "$((rss_pages * PAGE_SIZE_KB))" \
+        "$((vsize / 1024))" \
+        "${vmhwm:-0}"
 }
 
 sum_res_pids() {
     local runid1="$1"
+    local elapsed="$2"
     local temp_file=""
     local curid1=""
-    local pp=""
-    local vmpeak=""
-    local etime=""
     local res=""
     local pids=( "$runid1" )
 
@@ -239,34 +285,22 @@ sum_res_pids() {
         [[ -n "$curid1" ]] && pids+=( "$curid1" )
     done < <(collect_child_pids "$runid1")
 
-    etime=$(ps --no-header -o etimes= -p "$runid1" 2>/dev/null | awk 'NR==1 {print $1+0}')
-    if [ -z "$etime" ]; then
-        etime=0
-    fi
-
     for curid1 in "${pids[@]}"; do
-        pp=$(ps --no-header -o cputimes=,pcpu=,rss=,vsz= -p "$curid1" 2>/dev/null | awk 'NF {print $1, $2, $3, $4}')
-        [[ -n "$pp" ]] || continue
-
-        if [[ -r "/proc/$curid1/status" ]]; then
-            vmpeak=$(awk '/VmHWM:/ {print $2; exit}' "/proc/$curid1/status")
-        else
-            vmpeak=0
-        fi
-        echo "$pp ${vmpeak:-0}" >> "$temp_file"
+        read_proc_metrics "$curid1" >> "$temp_file" 2>/dev/null || true
     done
 
     if [[ -s "$temp_file" ]]; then
-        res=$(awk '
+        res=$(awk -v elapsed="$elapsed" -v clk_tck="$CLK_TCK" '
             {
-                sum1 += $1
-                sum2 += $2
-                sum3 += $3
-                sum4 += $4
-                sum5 += $5
+                sum_ticks += $1
+                sum_rss += $2
+                sum_vsz += $3
+                sum_vmhwm += $4
             }
             END {
-                printf "%d\t%.2f\t%d\t%d\t%d", sum1, sum2, sum3, sum4, sum5
+                cpu_seconds = (clk_tck > 0 ? sum_ticks / clk_tck : 0)
+                pcpu = (elapsed > 0 ? (cpu_seconds * 100.0 / elapsed) : 0)
+                printf "%d\t%.2f\t%d\t%d\t%d", cpu_seconds, pcpu, sum_rss, sum_vsz, sum_vmhwm
             }
         ' "$temp_file")
     else
@@ -274,12 +308,15 @@ sum_res_pids() {
     fi
 
     rm -f "$temp_file"
-    echo -e "$etime\t$res"
+    echo -e "$elapsed\t$res"
 }
 
 monitor() {
     local interval="$1"
     local logfile="$2"
+    local start_epoch=0
+    local now_epoch=0
+    local elapsed=0
     local mid=$BASHPID
     local curid=$$
     local ppid=$PPID
@@ -294,9 +331,12 @@ monitor() {
     echo "\$PPID: $ppid" >> "$logfile"
     echo "" >> "$logfile"
     echo -e "Time\tELAPSED\tCPU_SECONDS\t%CPU\tRSS\tVSZ\tVmHWM" >> "$logfile"
+    start_epoch=$(date +%s)
 
     while true; do
         timeNow="$(date +%T)"
+        now_epoch=$(date +%s)
+        elapsed=$((now_epoch - start_epoch))
         countChild=$(ps --no-headers -o pid= --ppid "$ppid" 2>/dev/null | sed '/^\s*$/d' | wc -l)
         if [ "$countChild" -eq 0 ]; then
             echo "" >> "$logfile"
@@ -307,7 +347,7 @@ monitor() {
         runct=$(ps --no-headers -o pid= --ppid "$curid" 2>/dev/null | grep -vw "$mid" | sed '/^\s*$/d' | wc -l)
         if [ "$runct" -eq 1 ]; then
             runid=$(ps --no-headers -o pid= --ppid "$curid" 2>/dev/null | grep -vw "$mid" | awk 'NR==1 {print $1}')
-            echo -e "$timeNow\t$(sum_res_pids "$runid")" >> "$logfile"
+            echo -e "$timeNow\t$(sum_res_pids "$runid" "$elapsed")" >> "$logfile"
         elif [ "$runct" -eq 0 ]; then
             echo "$timeNow: No job" >> "$logfile"
         else
@@ -318,6 +358,20 @@ monitor() {
         sleep "$interval"
     done
 }
+
+CLK_TCK=$(getconf CLK_TCK 2>/dev/null)
+if [[ -z "$CLK_TCK" || "$CLK_TCK" -le 0 ]]; then
+    CLK_TCK=100
+fi
+
+PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null)
+if [[ -z "$PAGE_SIZE" || "$PAGE_SIZE" -le 0 ]]; then
+    PAGE_SIZE=4096
+fi
+PAGE_SIZE_KB=$((PAGE_SIZE / 1024))
+if [[ "$PAGE_SIZE_KB" -le 0 ]]; then
+    PAGE_SIZE_KB=4
+fi
 
 monitor "$tMon" "$mlog" &
 EOF
